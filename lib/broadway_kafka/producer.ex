@@ -53,6 +53,9 @@ defmodule BroadwayKafka.Producer do
     * `:client_config` - Optional. A list of options used when creating the client. See the
       ["Client config options"](#module-client-config-options) section below for a list of all available options.
 
+    * `:ack_config` - Optional. A list of options used when acknowledging messages.  See the
+      ["Acknowledgement config options"](#module-acknowledgement-config-options) section below for a list of all available options.
+
   ## Group config options
 
   The available options that will be passed to `:brod`'s group coordinator.
@@ -152,6 +155,48 @@ defmodule BroadwayKafka.Producer do
         ]
       )
 
+  ## Acknowledgement config options
+
+  By default `BroadwayKafka` always acknowledges all messages regardless of any failure conditions.
+  This avoids a situation where troublesome messages can "stop up" processing the message stream.
+
+  While this is a sensible default, it's not ideal for all use cases. Even when explicit error
+  handling (see `c:Broadway.handle_failed/2`) has been implemented, it can still be important to
+  carefully handle acknowledgedments based on your application's consistency needs.
+
+  Four types of acknowledgement behavior can be used:
+
+    * `ack` - unconditionally acknowledge the message
+
+    * `reconnect` - disconnects the client, which will reconnect on its own after a timeout
+
+    * `abort` - causes the whole pipeline to exit abnormally, which may be restarted by a supervisor
+
+    * `hang` - doesn't acknowledge, use with caution, as this may hang up your queue forever
+
+  Three different settings are provided to assign one of those acknowledgement behaviors based on
+  what happens during message handling:
+
+    * `on_fail` - Determines if failures in `c:Broadway.handle_message/3` and
+      `c:Broadway.handle_batch/4` are acknowledged.  Defaults to `ack`.
+
+    * `on_crash` - Determines if failures in `c:Broadway.handle_failed/2` are acknowledged.
+       Defaults to do whatever `on_fail` is set to do.
+
+    * `on_success` - Determines if successful messages are automatically acknowledged.  Can be
+      disabled in situations where acknowledgement of messages must be very tightly controlled.
+      Defaults to `ack`.
+
+  The distinction between failing and crashing allows for situations where
+  `c:Broadway.handle_failed/2` is used to ensure messages aren't lost (e.g. are written to a
+  dead-letter queue) or cannot be retried later to preserve ordering (e.g.  resource reservation,
+  sensor data).
+
+  While these settings affect the default behavior, they can also be overriden on a per-message
+  basis (see `c:Broadway.Message.configure_ack/2`).  In cases where `on_success` is configured to
+  `ack` by default, per-message configuration can be used to explicitly acknowledge individual
+  messages.
+
   ## Concurrency and partitioning
 
   The concurrency model provided by Kafka is based on partitioning, i.e., the more partitions
@@ -170,12 +215,40 @@ defmodule BroadwayKafka.Producer do
 
   ## Handling failed messages
 
-  `BroadwayKafka` never stops the flow of the stream, i.e. it will **always ack** the messages
-  even when they fail. Unlike queue-based connectors, where you can mark a single message as failed.
-  In Kafka that's not possible due to its single offset per topic/partition ack strategy. If you
-  want to reprocess failed messages, you need to roll your own strategy. A possible way to do that
-  is to implement `c:Broadway.handle_failed/2` and send failed messages to a separated stream or queue for
-  later processing.
+  By default `BroadwayKafka` never stops the flow of the stream, i.e. it will **always ack** the
+  messages even when they fail unless told to do otherwise. Unlike queue-based connectors, where you
+  can mark a single message as failed, Kafka cannot do so due to its single offset per
+  topic/partition ack strategy.
+
+  `BroadwayKafka` allows more sophisticated failure handling in three ways:
+
+    * Implement `c:Broadway.handle_failed/2` to respond expected failures in
+      `c:Broadway.handle_message/3` and `c:Broadway.handle_batch/3` (e.g. delivering failed messages
+      to a dead-letter queue for reprocessing).
+
+    * Use `Broadway.Message.configure_ack/2` to change how failures affect acknowledging
+      individual failed messages or failures in error handling (e.g. suspend the pipeline when a
+      critical message fails to be processed).
+
+    * Set `ack_config` options to change how failures affect acknowledging failed messages or
+      failures in error handling by default (e.g. all failures suspend the pipeline unless otherwise
+      disabled).
+
+  These options aren't mutually-exclusive and may be used together.  The distinction between failing
+  and crashing can be critical in situations where the error handling guarantees messages are not
+  lost and the "always ack" strategy would acknowledge messages that couldn't be saved.  See
+  ["Acknowledgement config options"](#module-acknowledgement-config-options) for more details.
+
+  In most environments, failure will either be transient (e.g. network failure, resource exhaustion)
+  or persistent (e.g. logic bugs, bad data).  Choosing `reconnect` for `on_fail` can enable you to
+  recover from such transient errors.  Choosing `abort` or `hang` for `on_crash` works similarly for
+  transient errors.  It also gives a decent workflow for persistent errors, as deploying new code
+  will trigger a retry which will then succeed.
+
+  Note that Kafka's livelock detection is implemented client-side. That is, the
+  `max.poll.interval.ms` setting that you may read about for consumers must be supported by your
+  client library.  As of `:brod` 3.16, no equivalent functionality has been implemented.  So it is
+  up to you to detect this and "clear the blockage".
 
   ## Message metadata
 
